@@ -48,6 +48,13 @@ INTERVENTIONS = [
 class LoopDetector:
     """流式死循环检测器（每个请求尝试一个实例）"""
 
+    # 重复判定时剥离的标点/空白（用于主体长度判定）
+    _STRIP = re.compile(r"[\s，。、；：！？,.?!;:()\[\]{}<>\"'`~\-—…\n\t\r]")
+    # 带标点/空白变体的重复：同一句以不同标点反复出现（字面连续匹配会漏掉）
+    _REP_VARIANT = re.compile(
+        r"(.{6,100})[\s，。、；：！？,.?!;:()\[\]{}<>\"'`~\-—…]{1,8}"
+        r"\1[\s，。、；：！？,.?!;:()\[\]{}<>\"'`~\-—…]{1,8}\1", re.S)
+
     def __init__(self, cfg):
         self.cfg = cfg
         self.reasoning_text = ""
@@ -78,16 +85,23 @@ class LoopDetector:
         return None
 
     def _repeat(self, text: str, span_min: int) -> bool:
-        """窗口内是否存在长重复片段（剥离标点/空白后重复主体仍够长才算）"""
+        """窗口内是否存在长重复片段。
+
+        字面连续重复用 _rep 匹配（须剥离标点后主体 ≥5 字符）；
+        另用 _REP_VARIANT 匹配"同一句带不同标点反复输出"的变体
+        （如 "我们需要继续分析！…我们需要继续分析？…我们需要继续分析。"），
+        字面连续匹配会漏掉这类死循环。
+        """
         if len(text) < span_min:
             return False
-        m = self._rep.search(text[-4096:])
-        if not m:
-            return False
-        core = re.sub(r"[\s，。、；：！？,.?!;:()\[\]{}<>\"'`~\-—…\n\t\r]", "", m.group(1))
-        if len(core) < 5:
-            return False
-        return len(m.group(0)) >= span_min
+        text = text[-4096:]
+        m = self._rep.search(text)
+        if m:
+            core = self._STRIP.sub("", m.group(1))
+            if len(core) < 5:
+                return False
+            return len(m.group(0)) >= span_min
+        return self._REP_VARIANT.search(text) is not None
 
 
 def intervene_intervention(payload: dict, attempt: int) -> dict:
