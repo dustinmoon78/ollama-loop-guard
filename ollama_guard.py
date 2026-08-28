@@ -261,10 +261,8 @@ class GuardHandler(BaseHTTPRequestHandler):
                     self._log("EMPTY RESPONSE -> retry %d (no intervention)", empty_retry + 1)
                     empty_retry += 1
                     continue  # 原样重发，不注入干预
-                # 耗尽：静默结束流（补 [DONE]），不报错——由客户端侧(如 ZCode Stop hook)兜底续跑
-                self._log("GIVE UP on empty response (silent)")
-                self._send_sse_event("data: [DONE]")
-                self._chunk_end()
+                # 耗尽：直接关闭连接 → ZCode 看到 network_error(retryable) → 触发其内置重试
+                self._log("GIVE UP on empty response (close connection for client retry)")
                 return
             if result == "truncated thinking (finish=length, no output)":
                 if empty_retry < cfg.max_empty_retries:
@@ -279,10 +277,11 @@ class GuardHandler(BaseHTTPRequestHandler):
                 self._chunk_end()
                 return
             if result.startswith("reasoning stall"):
-                # 上游零输出卡死：干预对云端卡死无效，立即静默结束流，交给客户端(如 Stop hook)续跑
-                self._log("GIVE UP on reasoning stall (silent)")
-                self._send_sse_event("data: [DONE]")
-                self._chunk_end()
+                # 上游零输出卡死：直接关闭连接 → ZCode 看到 network_error(retryable) → 触发内置重试
+                self._log("GIVE UP on reasoning stall (close connection for client retry)")
+                return
+            # client_gone：客户端已断开，无需重试
+            if result == "client_gone":
                 return
             # 其余为死循环（有实际重复输出）：注入干预重发
             if attempt >= cfg.max_retries:
@@ -498,7 +497,7 @@ def parse_args():
     p.add_argument("--max-retries", type=int, default=3, help="死锁重试次数（干预逐级升级）")
     p.add_argument("--retry-empty", action="store_true", default=True,
                    help="流正常结束但零输出/只出思考时原样重试（默认开）")
-    p.add_argument("--max-empty-retries", type=int, default=3,
+    p.add_argument("--max-empty-retries", type=int, default=10,
                    help="空响应/截断重试次数（不注入干预）")
     p.add_argument("--reasoning-char-limit", type=int, default=20000, help="思考字符量上限")
     p.add_argument("--repeat-span-min", type=int, default=24, help="思考重复判定最小重复串长度")

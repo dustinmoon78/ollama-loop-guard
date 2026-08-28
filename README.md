@@ -43,12 +43,14 @@ stream:
 
 | Case | Trigger | Action | After retries exhausted |
 |---|---|---|---|
-| Empty response | stream ends, no content & no reasoning | resend verbatim, no intervention (`--retry-empty`, `--max-empty-retries`, default 1) | **end the stream silently** (emit `[DONE]`, no error) so a client-side fallback (e.g. a Stop hook) can continue the turn |
+| Empty response | stream ends, no content & no reasoning | resend verbatim, no intervention (`--retry-empty`, `--max-empty-retries`, default 1) | **close connection** — client sees `network_error` (retryable), ZCode auto-retries the turn |
 | Truncated thinking | `finish_reason: length`, only reasoning produced | append a "continue" user message and resend with `max_tokens` ×4 (clamped to 1M) | SSE error `ollama_loop_guard_truncated` |
 
 Empty-response retries deliberately do **not** inject an intervention prompt — the model is not
-stuck, the upstream just returned nothing. Ending silently lets client-side auto-continue logic
-(ZCode's Stop hook, etc.) pick up the turn without the user ever seeing an error.
+stuck, the upstream just returned nothing. After exhausting retries, the proxy closes the
+connection (no `[DONE]`, no error event), so the client sees a network error and triggers its
+built-in retry logic (ZCode has 10 automatic retries for `network_error`). This keeps the task
+running transparently.
 
 ## Quick start
 
