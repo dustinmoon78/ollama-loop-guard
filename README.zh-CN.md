@@ -29,6 +29,20 @@
 
 超过重试上限后，代理以 SSE error 事件结束流——客户端收到可见的失败，而不是无限烧额度。
 
+## 空响应与截断处理
+
+除死循环外，云端模型还会间歇性返回**空响应**（流结束但思考与内容都为零），或在**思考中途被
+截断**（`finish_reason: length`，只有 reasoning 没有 content）。代理在同一个响应流内对两者
+透明重试：
+
+| 场景 | 触发 | 动作 | 重试耗尽后 |
+|---|---|---|---|
+| 空响应 | 流结束，零内容零思考 | 原样重发，不注入干预（`--retry-empty` / `--max-empty-retries`，默认 1） | **静默结束流**（补发 `[DONE]`，不发 error），交给客户端侧兜底（如 Stop hook）续跑 |
+| 截断思考 | `finish_reason: length`，只产出了思考 | 追加"自动续接"user 消息重发，`max_tokens` ×4（钳制在 1M） | SSE error `ollama_loop_guard_truncated` |
+
+空响应重试**刻意不注入干预提示词**——模型没有卡死，只是上游没返回内容。耗尽后静默结束，
+让客户端侧的自动续写逻辑（ZCode 的 Stop hook 等）接续回合，用户全程无感。
+
 ## 快速开始
 
 依赖：Python 3.10+（`requests`）、Ollama 运行在 `localhost:11434`。
@@ -66,8 +80,14 @@ WshShell.Run "pythonw bootstrap.py", 0, False
 python ollama_guard.py --port 11435 \
   --max-reasoning-sec 60 --max-total-sec 240 --max-retries 2 \
   --reasoning-char-limit 20000 --repeat-span-min 24 --content-repeat-span-min 100 \
+  --retry-empty --max-empty-retries 1 \
   --log-file guard.log
 ```
+
+- `--retry-empty` / `--max-empty-retries`（默认 1）：空响应原样重试（不注入干预）最多 N 次；
+  耗尽后静默结束流。
+- 截断思考复用同一 `--max-empty-retries` 预算，但重试时追加"自动续接"消息并把 `max_tokens`
+  ×4（钳制在 1 000 000）。
 
 ## 打断原理
 
@@ -75,6 +95,9 @@ python ollama_guard.py --port 11435 \
 socket，Ollama 立即停止生成；随后在同一个客户端流内注入 system 干预消息重发
 （"检测到重复循环，立即停止一切重复推理，直接给出最终答案"，第二次再加 `thinking: disabled`）。
 客户端无需改任何代码。
+
+空响应与截断重试**不走这条路径**——不注入干预提示词，且空响应的重试预算与死循环的
+`max-retries` 互相独立。
 
 ## 流完整性（重要实现细节）
 
@@ -84,21 +107,27 @@ socket，Ollama 立即停止生成；随后在同一个客户端流内注入 sys
 误判为行分隔符——把 JSON chunk 从字符串中间切开，客户端报 `Unterminated string in JSON`，
 且中文双重编码变乱码。bytes 模式的 `splitlines()` 只认 `\n`/`\r`，安全。
 
+另一条完整性规则：所有打断/重发路径在恢复流之前先补发一个空行，避免两个连续的 SSE 事件
+被拼在同一行（否则两个 JSON 对象共享一行会让客户端报 `JSON parsing failed`）。
+
 ## 安全
 
 - upstream 启动时固定解析，仅接受 http/https，且**解析出的每个地址都必须是环回地址**（其余一律拒绝）
 - 运行时只与启动时锁定的 `(scheme, ip, port)` 通信，不做 DNS 重解析（防 DNS rebinding）
 - 拒绝绝对 URL 路径与重定向（`allow_redirects=False`）
+- 默认只监听 `127.0.0.1`；**不要绑到 `0.0.0.0`**——本代理无鉴权，会转发到你的本地 Ollama
 
 ## 测试
 
 ```bash
-python test_loop_detector.py    # 9 个单元测试，无第三方依赖
-python mock_upstream.py         # mock 永不结束的慢思考上游（:11999）
+python test_loop_detector.py     # 13 个单元测试，无第三方依赖
+python mock_upstream.py          # mock 永不结束的慢思考上游（:11999）
+python mock_empty_trunc.py       # mock 空响应/截断/正常三种模式（:11998）
 ```
 
 配合 mock 上游（可加 `--max-reasoning-sec 5` 快速触发）可在本地跑通
-"打断 → 干预 → 重试 → 放弃" 全链路。
+"打断 → 干预 → 重试 → 放弃" 全链路。`mock_empty_trunc.py` 用于演练空响应重试与截断自动续思考
+路径（请求体里设 `"mode": "trunc"` / `"empty"` / `"ok"`）。
 
 ## License
 

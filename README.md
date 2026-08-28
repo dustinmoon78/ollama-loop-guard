@@ -32,6 +32,22 @@ Your client ──► :11435 ollama-loop-guard ──► Ollama :11434 (cloud mo
 After `max-retries` the proxy ends the stream with an SSE error event — your client gets a
 visible failure instead of burning quota forever.
 
+## Empty-response & truncated-thinking handling
+
+Besides dead loops, cloud models intermittently return an **empty response** (the stream ends
+with zero content and zero reasoning) or get **truncated mid-thinking** (`finish_reason: length`
+with reasoning but no content). The proxy retries both transparently inside the same response
+stream:
+
+| Case | Trigger | Action | After retries exhausted |
+|---|---|---|---|
+| Empty response | stream ends, no content & no reasoning | resend verbatim, no intervention (`--retry-empty`, `--max-empty-retries`, default 1) | **end the stream silently** (emit `[DONE]`, no error) so a client-side fallback (e.g. a Stop hook) can continue the turn |
+| Truncated thinking | `finish_reason: length`, only reasoning produced | append a "continue" user message and resend with `max_tokens` ×4 (clamped to 1M) | SSE error `ollama_loop_guard_truncated` |
+
+Empty-response retries deliberately do **not** inject an intervention prompt — the model is not
+stuck, the upstream just returned nothing. Ending silently lets client-side auto-continue logic
+(ZCode's Stop hook, etc.) pick up the turn without the user ever seeing an error.
+
 ## Quick start
 
 Requirements: Python 3.10+ with `requests`, Ollama running on `localhost:11434`.
@@ -71,8 +87,14 @@ WshShell.Run "pythonw bootstrap.py", 0, False
 python ollama_guard.py --port 11435 \
   --max-reasoning-sec 60 --max-total-sec 240 --max-retries 2 \
   --reasoning-char-limit 20000 --repeat-span-min 24 --content-repeat-span-min 100 \
+  --retry-empty --max-empty-retries 1 \
   --log-file guard.log
 ```
+
+- `--retry-empty` / `--max-empty-retries` (default 1): retry empty responses verbatim (no
+  intervention) up to N times; after that the stream ends silently.
+- Truncated thinking reuses the same `--max-empty-retries` budget, but appends a "continue"
+  message and scales `max_tokens` ×4 (clamped to 1 000 000) on retry.
 
 ## How the interruption works
 
@@ -81,6 +103,10 @@ at the HTTP layer: the proxy closes the upstream socket mid-stream, which makes 
 generating immediately. It then re-sends the request with an injected system message
 ("detected a repeated loop — stop all repeated reasoning and answer directly", escalating to
 `thinking: disabled` on the second retry) inside the same client stream. No client code changes.
+
+Empty-response and truncated-thinking retries do **not** go through this path — no intervention
+prompt is injected, and (for empty responses) a retry budget is kept separate from the dead-loop
+`max-retries`.
 
 ## Stream integrity (important implementation detail)
 
@@ -91,6 +117,10 @@ on purpose. With `decode_unicode=True`, `requests` decodes a charset-less
 middle of a string. The client then fails with `Unterminated string in JSON`, and the content
 is double-encoded mojibake. Bytes-mode `splitlines()` only splits on `\n`/`\r` — safe.
 
+Another integrity rule: every interruption/retry path emits a blank line before resuming the
+stream, so two consecutive SSE events never get glued onto one line (which would make a
+client fail with `JSON parsing failed` on two JSON objects sharing a line).
+
 ## Security
 
 - Upstream is resolved once at startup; only `http(s)` is accepted and **every resolved
@@ -98,16 +128,21 @@ is double-encoded mojibake. Bytes-mode `splitlines()` only splits on `\n`/`\r` �
 - At runtime the proxy talks to the startup-locked `(scheme, ip, port)` only — no DNS
   rebinding attacks
 - Absolute URL paths and redirects are rejected (`allow_redirects=False`)
+- The proxy listens on `127.0.0.1` by default; do not bind it to `0.0.0.0` — it has no
+  authentication and forwards to your local Ollama
 
 ## Tests
 
 ```bash
-python test_loop_detector.py    # 9 unit tests, no third-party deps
-python mock_upstream.py         # mock never-ending slow-reasoning upstream on :11999
+python test_loop_detector.py     # 13 unit tests, no third-party deps
+python mock_upstream.py          # mock never-ending slow-reasoning upstream on :11999
+python mock_empty_trunc.py       # mock empty-response / truncated-thinking / ok modes on :11998
 ```
 
 Run the mock upstream (optionally with `--max-reasoning-sec 5`) to exercise the full
-interrupt → intervene → retry → give-up chain locally.
+interrupt → intervene → retry → give-up chain locally. `mock_empty_trunc.py` exercises the
+empty-response retry and truncated-thinking auto-continue paths (set `"mode": "trunc"`,
+`"empty"`, or `"ok"` in the request body).
 
 ## License
 
