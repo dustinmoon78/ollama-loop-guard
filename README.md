@@ -1,5 +1,7 @@
 # ollama-loop-guard
 
+> [中文文档 (Chinese)](README.zh-CN.md)
+
 A lightweight HTTP proxy that **breaks out of infinite thinking loops** in Ollama cloud models.
 
 Some Ollama cloud models (e.g. `deepseek-v4-flash:0731-cloud`, mounted locally as a tag) can
