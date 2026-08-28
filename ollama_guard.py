@@ -335,8 +335,13 @@ class GuardHandler(BaseHTTPRequestHandler):
                     if not hit:
                         hit = det.check_elapsed()
                     if hit:
-                        self._chunk(b"\n")  # 结束当前 SSE 事件边界，避免与重发流粘行
-                        return hit  # 断开上游 → Ollama 停止
+                        if det.saw_content:
+                            # 已产出正文：不打断，让流自然跑完。用户不希望正跑时中断；
+                            # 正文阶段的真死循环交给客户端侧(Stop hook/重试)兜底。
+                            hit = None
+                        else:
+                            self._chunk(b"\n")  # 结束当前 SSE 事件边界，避免与重发流粘行
+                            return hit  # 断开上游 → Ollama 停止（仅纯思考阶段）
                     if raw.strip() == b"data: [DONE]":
                         # 流结束事件：空响应 / 截断需要续发 → 截住 [DONE] 不透传，直接重发
                         if not det.saw_content and not det.saw_reasoning:
