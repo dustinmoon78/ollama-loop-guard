@@ -261,9 +261,19 @@ class GuardHandler(BaseHTTPRequestHandler):
                     self._log("EMPTY RESPONSE -> retry %d (no intervention)", empty_retry + 1)
                     empty_retry += 1
                     continue  # 原样重发，不注入干预
-                # 耗尽：直接关闭连接 → ZCode 看到 network_error(retryable) → 触发其内置重试
-                self._log("GIVE UP on empty response (close connection for client retry)")
-                return
+                # 初始重试耗尽：进入保活模式，继续重试同时发心跳保活
+                if not st.get("keepalive_start"):
+                    st["keepalive_start"] = time.time()
+                    self._log("EMPTY RESPONSE -> entering keepalive mode (max %ds)", cfg.max_empty_keepalive_sec)
+                elapsed = time.time() - st["keepalive_start"]
+                if elapsed >= cfg.max_empty_keepalive_sec:
+                    self._log("GIVE UP on empty response (keepalive timeout %ds)", cfg.max_empty_keepalive_sec)
+                    self._chunk(b"\n")  # 发送空行保活
+                    return
+                # 保活重试：发心跳 + 原样重发
+                self._chunk(b": heartbeat\n\n")  # SSE 注释保活
+                self._log("EMPTY RESPONSE -> keepalive retry (elapsed %.0fs)", elapsed)
+                continue
             if result == "truncated thinking (finish=length, no output)":
                 if empty_retry < cfg.max_empty_retries:
                     self._log("TRUNCATED thinking -> auto-continue retry %d", empty_retry + 1)
@@ -277,9 +287,18 @@ class GuardHandler(BaseHTTPRequestHandler):
                 self._chunk_end()
                 return
             if result.startswith("reasoning stall"):
-                # 上游零输出卡死：直接关闭连接 → ZCode 看到 network_error(retryable) → 触发内置重试
-                self._log("GIVE UP on reasoning stall (close connection for client retry)")
-                return
+                # 上游零输出卡死：进入保活模式，继续重试同时发心跳保活
+                if not st.get("keepalive_start"):
+                    st["keepalive_start"] = time.time()
+                    self._log("REASONING STALL -> entering keepalive mode (max %ds)", cfg.max_empty_keepalive_sec)
+                elapsed = time.time() - st["keepalive_start"]
+                if elapsed >= cfg.max_empty_keepalive_sec:
+                    self._log("GIVE UP on reasoning stall (keepalive timeout %ds)", cfg.max_empty_keepalive_sec)
+                    self._chunk(b"\n")
+                    return
+                self._chunk(b": heartbeat\n\n")
+                self._log("REASONING STALL -> keepalive retry (elapsed %.0fs)", elapsed)
+                continue
             # client_gone：客户端已断开，无需重试
             if result == "client_gone":
                 return
@@ -499,6 +518,8 @@ def parse_args():
                    help="流正常结束但零输出/只出思考时原样重试（默认开）")
     p.add_argument("--max-empty-retries", type=int, default=10,
                    help="空响应/截断重试次数（不注入干预）")
+    p.add_argument("--max-empty-keepalive-sec", type=int, default=300,
+                   help="初始重试耗尽后保活时长（秒），期间继续重试并发送心跳保活")
     p.add_argument("--reasoning-char-limit", type=int, default=20000, help="思考字符量上限")
     p.add_argument("--repeat-span-min", type=int, default=24, help="思考重复判定最小重复串长度")
     p.add_argument("--content-repeat-span-min", type=int, default=100, help="输出重复判定最小重复串长度")

@@ -43,7 +43,7 @@ stream:
 
 | Case | Trigger | Action | After retries exhausted |
 |---|---|---|---|
-| Empty response | stream ends, no content & no reasoning | resend verbatim, no intervention (`--retry-empty`, `--max-empty-retries`, default 1) | **close connection** — client sees `network_error` (retryable), ZCode auto-retries the turn |
+| Empty response | stream ends, no content & no reasoning | resend verbatim, no intervention (`--retry-empty`, `--max-empty-retries`, default 10) | **keepalive mode**: connection stays open, continues retrying with SSE heartbeat comments (up to `--max-empty-keepalive-sec`, default 300s) |
 | Truncated thinking | `finish_reason: length`, only reasoning produced | append a "continue" user message and resend with `max_tokens` ×4 (clamped to 1M) | SSE error `ollama_loop_guard_truncated` |
 
 Empty-response retries deliberately do **not** inject an intervention prompt — the model is not

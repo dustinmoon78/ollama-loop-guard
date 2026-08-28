@@ -37,7 +37,7 @@
 
 | 场景 | 触发 | 动作 | 重试耗尽后 |
 |---|---|---|---|
-| 空响应 | 流结束，零内容零思考 | 原样重发，不注入干预（`--retry-empty` / `--max-empty-retries`，默认 1） | **关闭连接** → 客户端看到 `network_error`（可重试），ZCode 自动重试该轮对话 |
+| 空响应 | 流结束，零内容零思考 | 原样重发，不注入干预（`--retry-empty` / `--max-empty-retries`，默认 10） | **保活模式**：连接保持打开，继续重试并发送心跳保活（最长 `--max-empty-keepalive-sec`，默认 300s） |
 | 截断思考 | `finish_reason: length`，只产出了思考 | 追加"自动续接"user 消息重发，`max_tokens` ×4（钳制在 1M） | SSE error `ollama_loop_guard_truncated` |
 
 空响应重试**刻意不注入干预提示词**——模型没有卡死，只是上游没返回内容。耗尽后关闭连接，
