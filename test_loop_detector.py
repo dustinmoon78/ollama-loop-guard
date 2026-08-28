@@ -77,6 +77,39 @@ def test_total_timeout():
     assert det.check_elapsed() == "total timeout (120s)"
 
 
+def test_empty_response_detection():
+    det = og.LoopDetector(Cfg())
+    # 流结束，零思考零内容 → 空响应
+    assert not det.saw_reasoning and not det.saw_content
+    assert det.finish_reason is None
+
+
+def test_truncated_thinking_detection():
+    det = og.LoopDetector(Cfg())
+    det.feed_reasoning("思考中的内容")
+    det.finish_reason = "length"
+    assert det.saw_reasoning and not det.saw_content
+    assert det.finish_reason == "length"
+
+
+def test_continue_thinking_appends_and_scales():
+    body = {"messages": [{"role": "user", "content": "hi"}], "max_tokens": 100}
+    out = og.continue_thinking(body)
+    assert out["messages"][-1]["role"] == "user"
+    assert "自动续接" in out["messages"][-1]["content"]
+    assert out["max_tokens"] == 400
+    # 原 payload 不被污染
+    assert body["max_tokens"] == 100
+    assert len(body["messages"]) == 1
+
+
+def test_continue_thinking_no_max_tokens_ok():
+    body = {"messages": [{"role": "user", "content": "hi"}]}
+    out = og.continue_thinking(body)
+    assert "max_tokens" not in out
+    assert out["messages"][-1]["role"] == "user"
+
+
 def test_intervention_escalation():
     body = {"messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled"}}
     first = og.intervene_intervention(body, 0)

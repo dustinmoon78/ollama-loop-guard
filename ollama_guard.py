@@ -59,11 +59,15 @@ class LoopDetector:
         self.cfg = cfg
         self.reasoning_text = ""
         self.content_text = ""
+        self.saw_reasoning = False  # 本流是否产出过思考
+        self.saw_content = False  # 本流是否产出过可见内容
+        self.finish_reason = None  # 上游结束事件的 finish_reason（如 "length"）
         self.started = time.monotonic()
         self._rep = re.compile(r"(.{8,200})\1{2,}", re.S)
 
     def feed_reasoning(self, chunk: str):
         self.reasoning_text += chunk
+        self.saw_reasoning = True
         if len(self.reasoning_text) > self.cfg.reasoning_char_limit:
             return "reasoning overflow ({} chars)".format(self.cfg.reasoning_char_limit)
         if self._repeat(self.reasoning_text, self.cfg.repeat_span_min):
@@ -72,6 +76,7 @@ class LoopDetector:
 
     def feed_content(self, chunk: str) -> str | None:
         self.content_text += chunk
+        self.saw_content = True
         if self._repeat(self.content_text, self.cfg.content_repeat_span_min):
             return "content repetition"
         return None
@@ -111,6 +116,22 @@ def intervene_intervention(payload: dict, attempt: int) -> dict:
     body["messages"] = [{"role": "system", "content": INTERVENTIONS[attempt]}] + msgs
     if attempt >= 1 and isinstance(body.get("thinking"), dict):
         body["thinking"] = {"type": "disabled"}
+    return body
+
+
+def continue_thinking(payload: dict) -> dict:
+    """截断(只出思考没出内容)时自动续思考：追加继续指令，并放大/取消 max_tokens 避免二次顶死"""
+    body = dict(payload)
+    msgs = list(body.get("messages", []))
+    msgs = msgs + [{"role": "user", "content": "（自动续接）上一步只进行了推理未产出正式回答。请直接基于已有推理，给出完整、自洽的最终答案，不要重复推理过程。"}]
+    body["messages"] = msgs
+    if "max_tokens" in body:
+        if isinstance(body["max_tokens"], (int, float)):
+            # 放大但钳制在 1M 内，避免超上游上限反而被拒
+            body["max_tokens"] = min(int(body["max_tokens"]) * 4, 1_000_000)
+        # 若非数值则不处理（保留原值）
+    if "max_completion_tokens" in body and isinstance(body["max_completion_tokens"], (int, float)):
+        body["max_completion_tokens"] = min(int(body["max_completion_tokens"]) * 4, 1_000_000)
     return body
 
 
@@ -212,6 +233,7 @@ class GuardHandler(BaseHTTPRequestHandler):
         cfg = self.guard.cfg
         st = {"headers": False}
         attempt = 0
+        empty_retry = 0
         while True:
             result = self._stream_attempt(url, payload, st)
             if result is None:
@@ -226,6 +248,29 @@ class GuardHandler(BaseHTTPRequestHandler):
                     self._chunk_end()
                 return
             # 死循环命中（result = reason 字符串）
+            if result == "empty response":
+                if cfg.retry_empty and empty_retry < cfg.max_empty_retries:
+                    self._log("EMPTY RESPONSE -> retry %d (no intervention)", empty_retry + 1)
+                    empty_retry += 1
+                    continue  # 原样重发，不注入干预
+                # 耗尽：静默结束流（补 [DONE]），不报错——由客户端侧(如 ZCode Stop hook)兜底续跑
+                self._log("GIVE UP on empty response (silent)")
+                self._send_sse_event("data: [DONE]")
+                self._chunk_end()
+                return
+            if result == "truncated thinking (finish=length, no output)":
+                if empty_retry < cfg.max_empty_retries:
+                    self._log("TRUNCATED thinking -> auto-continue retry %d", empty_retry + 1)
+                    payload = continue_thinking(payload)
+                    empty_retry += 1
+                    continue
+                self._log("GIVE UP on truncated thinking")
+                self._send_sse_event("data: " + json.dumps(
+                    {"error": {"message": "truncated thinking after %d retries" % empty_retry,
+                               "type": "ollama_loop_guard_truncated"}}, ensure_ascii=False) + "\n\n")
+                self._chunk_end()
+                return
+            # 其余为死循环：注入干预重发
             if attempt >= cfg.max_retries:
                 self._log("GIVE UP after %d retries: %s", cfg.max_retries, result)
                 self._send_sse_event("data: " + json.dumps(
@@ -268,18 +313,30 @@ class GuardHandler(BaseHTTPRequestHandler):
                     if raw.startswith(b"data: "):
                         try:
                             ev = json.loads(raw[6:])
-                            delta = (ev.get("choices") or [{}])[0].get("delta", {})
+                            ch = (ev.get("choices") or [{}])[0]
+                            delta = ch.get("delta", {})
                             r, c = delta.get("reasoning"), delta.get("content")
                             if r:
                                 hit = det.feed_reasoning(r)
                             elif c:
                                 hit = det.feed_content(c)
+                            if ch.get("finish_reason"):
+                                det.finish_reason = ch["finish_reason"]
                         except Exception:
                             pass
                     if not hit:
                         hit = det.check_elapsed()
                     if hit:
                         return hit  # 断开上游 → Ollama 停止
+                    if raw.strip() == b"data: [DONE]":
+                        # 流结束事件：空响应 / 截断需要续发 → 截住 [DONE] 不透传，直接重发
+                        if not det.saw_content and not det.saw_reasoning:
+                            return "empty response"
+                        if det.finish_reason == "length" and not det.saw_content and det.saw_reasoning:
+                            return "truncated thinking (finish=length, no output)"
+                        # 正常结束：透传 [DONE] 并结束流
+                        self._chunk(raw + b"\n")
+                        break
                     self._chunk(raw + b"\n")
                 self._chunk_end()
                 return None
@@ -366,6 +423,10 @@ def parse_args():
     p.add_argument("--max-reasoning-sec", type=float, default=60, help="思考阶段无输出超过该秒数 → 打断")
     p.add_argument("--max-total-sec", type=float, default=120, help="单次上游请求总时长上限")
     p.add_argument("--max-retries", type=int, default=2, help="死锁重试次数（干预逐级升级）")
+    p.add_argument("--retry-empty", action="store_true", default=True,
+                   help="流正常结束但零输出/只出思考时原样重试（默认开）")
+    p.add_argument("--max-empty-retries", type=int, default=1,
+                   help="空响应/截断重试次数（不注入干预）")
     p.add_argument("--reasoning-char-limit", type=int, default=20000, help="思考字符量上限")
     p.add_argument("--repeat-span-min", type=int, default=24, help="思考重复判定最小重复串长度")
     p.add_argument("--content-repeat-span-min", type=int, default=100, help="输出重复判定最小重复串长度")
