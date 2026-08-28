@@ -270,7 +270,13 @@ class GuardHandler(BaseHTTPRequestHandler):
                                "type": "ollama_loop_guard_truncated"}}, ensure_ascii=False) + "\n\n")
                 self._chunk_end()
                 return
-            # 其余为死循环：注入干预重发
+            if result.startswith("reasoning stall"):
+                # 上游零输出卡死：干预对云端卡死无效，立即静默结束流，交给客户端(如 Stop hook)续跑
+                self._log("GIVE UP on reasoning stall (silent)")
+                self._send_sse_event("data: [DONE]")
+                self._chunk_end()
+                return
+            # 其余为死循环（有实际重复输出）：注入干预重发
             if attempt >= cfg.max_retries:
                 self._log("GIVE UP after %d retries: %s", cfg.max_retries, result)
                 self._send_sse_event("data: " + json.dumps(
@@ -428,7 +434,7 @@ def parse_args():
     p.add_argument("--max-retries", type=int, default=2, help="死锁重试次数（干预逐级升级）")
     p.add_argument("--retry-empty", action="store_true", default=True,
                    help="流正常结束但零输出/只出思考时原样重试（默认开）")
-    p.add_argument("--max-empty-retries", type=int, default=1,
+    p.add_argument("--max-empty-retries", type=int, default=3,
                    help="空响应/截断重试次数（不注入干预）")
     p.add_argument("--reasoning-char-limit", type=int, default=20000, help="思考字符量上限")
     p.add_argument("--repeat-span-min", type=int, default=24, help="思考重复判定最小重复串长度")
