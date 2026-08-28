@@ -32,13 +32,17 @@ def main() -> int:
     if is_alive():
         print("guard already running on :%d" % PORT)
         return 0
+    stop_marker = os.path.join(HERE, ".guard-stop")
+    if os.path.exists(stop_marker):  # 残留停止标记会令 guard 启动即退出，先清掉
+        os.remove(stop_marker)
     logf = open(os.path.join(HERE, "guard.log"), "a", encoding="utf-8")
     flags = 0
     if os.name == "nt":
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "DETACHED_PROCESS", 0)
     subprocess.Popen(
         [sys.executable, "-u", os.path.join(HERE, "ollama_guard.py"),
-         "--port", str(PORT), "--log-file", os.path.join(HERE, "guard.log")],
+         "--port", str(PORT), "--log-file", os.path.join(HERE, "guard.log"),
+         "--stop-file", os.path.join(HERE, ".guard-stop")],
         cwd=HERE, stdout=logf, stderr=logf, creationflags=flags,
     )
     time.sleep(3)

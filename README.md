@@ -57,9 +57,15 @@ Requirements: Python 3.10+ with `requests`, Ollama running on `localhost:11434`.
 ```bash
 pip install -r requirements.txt
 ./start_guard.sh          # start (background, logs to guard.log)
-./start_guard.sh stop     # stop
+./start_guard.sh stop     # graceful stop: waits for active streams (≤60s), then exits
 ./start_guard.sh restart  # restart
 ```
+
+`stop` performs a **graceful shutdown**: it touches a marker file, the guard stops
+accepting new connections and waits for in-flight streams to finish (up to
+`--drain-timeout`, default 60 s) before exiting. Only if that times out does it
+force-kill. This keeps your session from being cut mid-generation when the proxy
+is restarted.
 
 Point your client at the proxy — that's the only change needed:
 

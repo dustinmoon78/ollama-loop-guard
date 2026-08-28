@@ -24,9 +24,11 @@ import argparse
 import ipaddress
 import json
 import logging
+import os
 import re
 import socket
 import sys
+import threading
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -150,28 +152,32 @@ class GuardHandler(BaseHTTPRequestHandler):
         self._forward(self.rfile.read(ln) if ln else None)
 
     def _forward(self, body):
+        self.guard.acquire()  # 优雅退出：活跃请求计数
         try:
-            target = self._target_url()
-            payload = None
-            if body:
-                try:
-                    payload = json.loads(body.decode("utf-8"))
-                except Exception:
-                    payload = None
-            if payload and payload.get("stream"):
-                self._stream_proxy(target, payload)
-            else:
-                self._plain_proxy(target, body, payload)
-        except ValueError as e:
-            self._send_json_error(400, str(e))
-        except (BrokenPipeError, ConnectionResetError):
-            log.info("client disconnected, upstream aborted")
-        except Exception:
-            log.error("handler error:\n%s", traceback.format_exc())
             try:
-                self._send_json_error(500, "internal error")
+                target = self._target_url()
+                payload = None
+                if body:
+                    try:
+                        payload = json.loads(body.decode("utf-8"))
+                    except Exception:
+                        payload = None
+                if payload and payload.get("stream"):
+                    self._stream_proxy(target, payload)
+                else:
+                    self._plain_proxy(target, body, payload)
+            except ValueError as e:
+                self._send_json_error(400, str(e))
+            except (BrokenPipeError, ConnectionResetError):
+                log.info("client disconnected, upstream aborted")
             except Exception:
-                pass
+                log.error("handler error:\n%s", traceback.format_exc())
+                try:
+                    self._send_json_error(500, "internal error")
+                except Exception:
+                    pass
+        finally:
+            self.guard.release()
 
     # ---------------- 安全与基础 ----------------
     def _target_url(self) -> str:
@@ -410,6 +416,29 @@ class GuardHandler(BaseHTTPRequestHandler):
                 attempt += 1
 
 
+class _StopFileWatcher(threading.Thread):
+    """轮询停止标记文件；出现后通知 httpd 优雅停止（停止接收新连接）。"""
+
+    def __init__(self, path, httpd, poll=0.5):
+        super().__init__(daemon=True)
+        self.path = path
+        self.httpd = httpd
+        self.poll = poll
+        self._stop = threading.Event()
+
+    def run(self):
+        while not self._stop.is_set():
+            if os.path.exists(self.path):
+                log.info("stop marker detected (%s) — graceful shutdown", self.path)
+                # 从 watcher 线程调用 shutdown()：令 serve_forever 返回并停止接收新连接
+                self.httpd.shutdown()
+                return
+            self._stop.wait(self.poll)
+
+    def request_stop(self):
+        self._stop.set()
+
+
 class GuardServer:
     def __init__(self, cfg):
         self.cfg = cfg
@@ -428,7 +457,35 @@ class GuardServer:
         # 固定到启动时解析出的第一个环回地址，不再运行时解析（防 DNS rebinding）
         self.upstream = "%s://%s:%d" % (u.scheme, addrs[0], port)
         self.httpd = ThreadingHTTPServer((cfg.host, cfg.port), GuardHandler)
+        # daemon_threads 保持默认 False：优雅退出时解释器会等非守护的 handler 线程
+        # （正在转发的活跃流）跑完才退出，而不是被主线程退出强杀。
         GuardHandler.guard = self
+        # 活跃连接计数：做优雅退出（等正在处理的流自然结束再退）
+        self._active = 0
+        self._active_lock = threading.Lock()
+
+    def acquire(self):
+        """进入一个客户端请求处理（进入时计数）"""
+        with self._active_lock:
+            self._active += 1
+
+    def release(self):
+        """离开一个客户端请求处理（结束时计数）"""
+        with self._active_lock:
+            self._active -= 1
+
+    def active_count(self) -> int:
+        with self._active_lock:
+            return self._active
+
+    def wait_idle(self, timeout: float) -> bool:
+        """等待活跃请求数降到 0；超时返回 False。graceful 停止时调用。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.active_count() == 0:
+                return True
+            time.sleep(0.1)
+        return False
 
 
 def parse_args():
@@ -447,6 +504,10 @@ def parse_args():
     p.add_argument("--repeat-span-min", type=int, default=24, help="思考重复判定最小重复串长度")
     p.add_argument("--content-repeat-span-min", type=int, default=100, help="输出重复判定最小重复串长度")
     p.add_argument("--log-file", default=None, help="日志文件路径（默认 stdout）")
+    p.add_argument("--stop-file", default=None,
+                   help="优雅停止标记文件：文件出现即停止接收新连接，等活跃流结束后退出（默认无）")
+    p.add_argument("--drain-timeout", type=float, default=60.0,
+                   help="优雅退出时等待活跃流结束的最长秒数（默认 60）")
     return p.parse_args()
 
 
@@ -463,9 +524,26 @@ def main():
              cfg.max_reasoning_sec, cfg.max_total_sec, cfg.max_retries,
              cfg.repeat_span_min, cfg.content_repeat_span_min)
     try:
+        stop_watch = None
+        if cfg.stop_file:
+            stop_watch = _StopFileWatcher(cfg.stop_file, srv.httpd)
+            stop_watch.start()
         srv.httpd.serve_forever()
     except KeyboardInterrupt:
         log.info("stopped")
+    finally:
+        if stop_watch:
+            stop_watch.request_stop()
+        # 优雅退出：停止接收新连接，等活跃流自然结束（最多 drain_timeout 秒）
+        if cfg.stop_file:
+            try:
+                srv.httpd.shutdown()  # 停止 serve_forever（阻塞返回）
+            except Exception:
+                pass  # Ctrl+C 已让 serve_forever 返回，shutdown 无副作用可忽略
+            if not srv.wait_idle(cfg.drain_timeout):
+                log.warning("drain timeout: %d active requests force-stopped",
+                            srv.active_count())
+            srv.httpd.server_close()
 
 
 if __name__ == "__main__":

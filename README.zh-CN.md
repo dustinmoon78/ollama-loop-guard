@@ -50,9 +50,13 @@
 ```bash
 pip install -r requirements.txt
 ./start_guard.sh          # 启动（后台常驻，日志 guard.log）
-./start_guard.sh stop     # 停止
+./start_guard.sh stop     # 优雅停止：等活跃流自然结束（≤60s）再退出
 ./start_guard.sh restart  # 重启
 ```
+
+`stop` 采用**优雅退出**：touch 停止标记文件，guard 停止接收新连接并**等正在处理的流自然
+结束**（最多 `--drain-timeout`，默认 60s）才退出；超时才强杀。这样重启 guard 时不会把
+正在生成的会话掐断。
 
 把客户端 baseURL 指向代理即可，无需其他改动：
 
