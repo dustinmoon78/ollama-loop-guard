@@ -36,12 +36,14 @@ import requests
 
 log = logging.getLogger("ollama-guard")
 
-# 干预消息（按重试次数逐级升级）
+# 干预消息（按重试次数逐级升级；长度须 ≥ --max-retries+1）
 INTERVENTIONS = [
     ("[系统干预] 检测到前一次生成陷入重复/死循环（重复输出或长时间无进展），已中断。"
      "请立即停止一切重复推理与试探，直接基于已有信息给出最终答案。"),
     ("[系统干预·第二次] 再次检测到重复循环。禁止继续推理，立即给出最终答案；"
      "若确实无法解决，请直接说明无法解决，不要重复尝试。"),
+    ("[系统干预·第三次] 已多次检测到死循环。立即停止所有推理，用一句话直接作答；"
+     "如果无法回答，明确说'无法解决'，不要输出任何推理过程。"),
 ]
 
 
@@ -431,7 +433,7 @@ def parse_args():
     p.add_argument("--upstream", default="http://localhost:11434")
     p.add_argument("--max-reasoning-sec", type=float, default=60, help="思考阶段无输出超过该秒数 → 打断")
     p.add_argument("--max-total-sec", type=float, default=120, help="单次上游请求总时长上限")
-    p.add_argument("--max-retries", type=int, default=2, help="死锁重试次数（干预逐级升级）")
+    p.add_argument("--max-retries", type=int, default=3, help="死锁重试次数（干预逐级升级）")
     p.add_argument("--retry-empty", action="store_true", default=True,
                    help="流正常结束但零输出/只出思考时原样重试（默认开）")
     p.add_argument("--max-empty-retries", type=int, default=3,
